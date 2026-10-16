@@ -35,14 +35,13 @@ class TransactionStore:
                     currency TEXT NOT NULL,
                     status TEXT NOT NULL CHECK (status IN ('PROCESSING', 'PROCESSED')),
                     created_at TEXT NOT NULL,
-                    processed_at TEXT,
-                    lease_until TEXT
+                    processed_at TEXT
                 )
                 """
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_transactions_work "
-                "ON transactions(status, lease_until)"
+                "ON transactions(status, created_at)"
             )
 
     def enqueue(self, transaction: TransactionWebhook) -> bool:
@@ -65,41 +64,18 @@ class TransactionStore:
             )
             return cursor.rowcount == 1
 
-    def claim_next(self) -> sqlite3.Row | None:
+    def process_due(self) -> int:
+        """Mark transactions older than the processing delay as PROCESSED."""
         now = utc_now()
-        lease = timestamp(now + timedelta(seconds=self.settings.processing_lease_seconds))
+        cutoff = timestamp(now - timedelta(seconds=self.settings.processing_delay_seconds))
         with self.connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
+            return connection.execute(
                 """
-                SELECT * FROM transactions
-                WHERE status = 'PROCESSING'
-                  AND (lease_until IS NULL OR lease_until <= ?)
-                ORDER BY created_at
-                LIMIT 1
+                UPDATE transactions SET status = 'PROCESSED', processed_at = ?
+                WHERE status = 'PROCESSING' AND created_at <= ?
                 """,
-                (timestamp(now),),
-            ).fetchone()
-            if row is None:
-                connection.commit()
-                return None
-            connection.execute(
-                "UPDATE transactions SET lease_until = ? WHERE transaction_id = ?",
-                (lease, row["transaction_id"]),
-            )
-            connection.commit()
-            return row
-
-    def mark_processed(self, transaction_id: str) -> None:
-        with self.connect() as connection:
-            connection.execute(
-                """
-                UPDATE transactions
-                SET status = 'PROCESSED', processed_at = ?, lease_until = NULL
-                WHERE transaction_id = ? AND status = 'PROCESSING'
-                """,
-                (timestamp(), transaction_id),
-            )
+                (timestamp(now), cutoff),
+            ).rowcount
 
     def get(self, transaction_id: str) -> sqlite3.Row | None:
         with self.connect() as connection:
