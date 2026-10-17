@@ -31,7 +31,7 @@ class TransactionStore:
             settings.database_url,
             min_size=1,
             max_size=10,
-            kwargs={"row_factory": dict_row},
+            kwargs={"row_factory": dict_row, "prepare_threshold": None},  # None: Supabase pooler (port 6543) is transaction-mode, no prepared stmts
             open=True,
         )
         with self.pool.connection() as connection:
