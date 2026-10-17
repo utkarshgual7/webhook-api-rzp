@@ -15,7 +15,7 @@ from worker import TransactionWorker
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 settings = load_settings()
-store = TransactionStore(settings.database_path, settings)
+store = TransactionStore(settings)
 worker = TransactionWorker(store)
 
 
@@ -24,6 +24,7 @@ async def lifespan(_: FastAPI):
     worker.start()
     yield
     worker.stop()
+    store.close()
 
 
 app = FastAPI(title="Transaction Webhook Service", lifespan=lifespan)

@@ -1,57 +1,54 @@
 from __future__ import annotations
 
-import sqlite3
-from datetime import timedelta
-from pathlib import Path
+from datetime import timezone
+
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from config import Settings
 from models import TransactionWebhook
-from time_utils import timestamp, utc_now
+from time_utils import timestamp
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS transactions (
+    transaction_id TEXT PRIMARY KEY,
+    source_account TEXT NOT NULL,
+    destination_account TEXT NOT NULL,
+    amount NUMERIC(20, 4) NOT NULL,
+    currency TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('PROCESSING', 'PROCESSED')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_transactions_work ON transactions(status, created_at);
+"""
 
 
 class TransactionStore:
-    def __init__(self, path: Path, settings: Settings) -> None:
-        self.path = path
+    def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+        self.pool = ConnectionPool(
+            settings.database_url,
+            min_size=1,
+            max_size=10,
+            kwargs={"row_factory": dict_row},
+            open=True,
+        )
+        with self.pool.connection() as connection:
+            connection.execute(SCHEMA)
 
-    def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout = 30000")
-        return connection
-
-    def _initialize(self) -> None:
-        with self.connect() as connection:
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS transactions (
-                    transaction_id TEXT PRIMARY KEY,
-                    source_account TEXT NOT NULL,
-                    destination_account TEXT NOT NULL,
-                    amount REAL NOT NULL,
-                    currency TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (status IN ('PROCESSING', 'PROCESSED')),
-                    created_at TEXT NOT NULL,
-                    processed_at TEXT
-                )
-                """
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_transactions_work "
-                "ON transactions(status, created_at)"
-            )
+    def close(self) -> None:
+        self.pool.close()
 
     def enqueue(self, transaction: TransactionWebhook) -> bool:
-        with self.connect() as connection:
+        with self.pool.connection() as connection:
             cursor = connection.execute(
                 """
-                INSERT OR IGNORE INTO transactions (
-                    transaction_id, source_account, destination_account, amount,
-                    currency, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, 'PROCESSING', ?)
+                INSERT INTO transactions (
+                    transaction_id, source_account, destination_account,
+                    amount, currency, status
+                ) VALUES (%s, %s, %s, %s, %s, 'PROCESSING')
+                ON CONFLICT (transaction_id) DO NOTHING
                 """,
                 (
                     transaction.transaction_id,
@@ -59,27 +56,31 @@ class TransactionStore:
                     transaction.destination_account,
                     transaction.amount,
                     transaction.currency.upper(),
-                    timestamp(),
                 ),
             )
             return cursor.rowcount == 1
 
     def process_due(self) -> int:
         """Mark transactions older than the processing delay as PROCESSED."""
-        now = utc_now()
-        cutoff = timestamp(now - timedelta(seconds=self.settings.processing_delay_seconds))
-        with self.connect() as connection:
+        with self.pool.connection() as connection:
             return connection.execute(
                 """
-                UPDATE transactions SET status = 'PROCESSED', processed_at = ?
-                WHERE status = 'PROCESSING' AND created_at <= ?
+                UPDATE transactions SET status = 'PROCESSED', processed_at = now()
+                WHERE status = 'PROCESSING'
+                  AND created_at <= now() - make_interval(secs => %s)
                 """,
-                (timestamp(now), cutoff),
+                (self.settings.processing_delay_seconds,),
             ).rowcount
 
-    def get(self, transaction_id: str) -> sqlite3.Row | None:
-        with self.connect() as connection:
-            return connection.execute(
-                "SELECT * FROM transactions WHERE transaction_id = ?",
+    def get(self, transaction_id: str) -> dict | None:
+        with self.pool.connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM transactions WHERE transaction_id = %s",
                 (transaction_id,),
             ).fetchone()
+        if row is None:
+            return None
+        for key in ("created_at", "processed_at"):
+            if row[key] is not None:
+                row[key] = timestamp(row[key].astimezone(timezone.utc))
+        return row

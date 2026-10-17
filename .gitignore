@@ -5,3 +5,4 @@ transactions.db
 *.db-shm
 *.db-wal
 venv/
+.env
